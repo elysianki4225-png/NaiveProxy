@@ -14,7 +14,7 @@
 ```
 
 **适用系统**：Debian 11+ / Ubuntu 20.04+ · x86_64 / arm64 / armv7
-**脚本**：[`naiveproxy-install.sh`](./naiveproxy-install.sh) · **版本**：v1.0.0 · **许可**：MIT
+**脚本**：[`naiveproxy-install.sh`](./naiveproxy-install.sh) · **版本**：v1.0.1 · **许可**：MIT
 
 ---
 
@@ -48,7 +48,7 @@
 | **域名自动生成** | 自动探测公网 IPv4，生成 `<随机8位>.<公网IP>.nip.io`，也支持你自己的域名 |
 | **灵活 ACME CA** | Let's Encrypt / **ZeroSSL（自动获取 EAB 凭据）** / staging / 自定义 ACME 目录，规避 Let's Encrypt 单主域限速 |
 | **HTTP/2 与 HTTP/3** | 默认同时开启 h2(TCP 443) 与 h3(QUIC/UDP 443)，也可只保留其中一种 |
-| **探针伪装（可自定义反代站点）** | `probe_resistance` + 反向代理**你自己输入的域名/URL**（默认 bing，可随时 `masq` 子命令热切换）或本机静态页面；未鉴权探测看到一个普通网站 |
+| **探针伪装（可自定义反代站点）** | `probe_resistance` + 反向代理**你自己输入的域名/URL**（默认 floridahigh.fyi，可随时 `masq` 子命令热切换）或本机静态页面；未鉴权探测看到一个普通网站 |
 | **自研加速模块（默认开启）** | 纯内核参数调优（BBR+fq、收发缓冲、TFO、MTU 探测、队列增大）+ `forward_proxy` 连接复用放大；不下载、不执行任何第三方脚本，三档可切、一键还原，详见 [docs/加速与性能.md](docs/加速与性能.md) |
 | **安全默认值** | 禁止代理访问内网/回环地址、隐藏 `Forwarded`/`Via` 头、`hide_ip`/`hide_via`、以 `caddy` 非 root 用户运行 |
 | **systemd 守护进程** | `Type=notify` + 开机自启 + 自动重启 + `AmbientCapabilities` 绑定 80/443 端口 |
@@ -82,7 +82,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/elysianki4225-png/NaiveP
 ### 方式 B：全自动安装（适合脚本化/无人值守）
 
 ```bash
-# ZeroSSL 证书（推荐，规避 Let's Encrypt 单主域限速）+ bing 反代伪装 + 随机域名与随机密码
+# ZeroSSL 证书（推荐，规避 Let's Encrypt 单主域限速）+ floridahigh.fyi 反代伪装 + 随机域名与随机密码
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/elysianki4225-png/NaiveProxy/main/naiveproxy-install.sh)" install \
   --ca zerossl --email you@example.com --yes
 ```
@@ -187,7 +187,7 @@ bash naiveproxy-install.sh [命令] [参数...]
 | `--http-port <端口>` | 80 | 证书校验与跳转端口 |
 | `--http3 <模式>` | `on` | `on`=h2+h3，`h2only`=仅 h2，`h3only`=关闭 h2（别名 `--h3`） |
 | `--masq <模式>` | `reverse` | `reverse`=反代真实网站，`static`=本机静态页，`none`=404 |
-| `--masq-target <域名/URL>` | `https://www.bing.com` | 反代（伪装）目标：**可直接写域名**（`www.bing.com`）或完整 URL，会做规范化与可达性检查 |
+| `--masq-target <域名/URL>` | `https://floridahigh.fyi` | 反代（伪装）目标：**可直接写域名**（`floridahigh.fyi`）或完整 URL，会做规范化与可达性检查 |
 | `--probe-secret <域名>` | 关闭 | 探针密道域名（需要该域名也解析到本机） |
 | `--run-as <caddy\|root>` | `caddy` | 运行身份（`caddy` 更安全） |
 | `--firewall <auto\|yes\|no>` | `auto` | 是否自动放行 ufw/firewalld 端口 |
@@ -253,7 +253,7 @@ sudo ./naiveproxy-install.sh uninstall --yes
   端口           : 443
   用户名         : u9k2m4p7q1
   密码           : Zx9Qw8Er7Ty6Ui5Op4As
-  伪装站点       : 反向代理 → https://www.bing.com
+  伪装站点       : 反向代理 → https://floridahigh.fyi
   协议支持       : HTTP/2 + HTTP/3
   证书 CA        : zerossl (https://acme.zerossl.com/v2/DV90)
   加速模块       : standard（拥塞控制=bbr 排队=fq 复用=256/16）
@@ -486,7 +486,7 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 			hide_ip
 			hide_via
 			probe_resistance
-			dial_timeout 30
+			dial_timeout 30s
 			# 连接复用：随加速档位 standard=256/16、aggressive=512/32、off=128/8
 			max_idle_conns 256
 			max_idle_conns_per_host 16
@@ -495,8 +495,8 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 				allow all
 			}
 		}
-		# 伪装内容：这里就是安装时你自己输入的域名/URL（默认 bing）
-		reverse_proxy https://www.bing.com {
+		# 伪装内容：这里就是安装时你自己输入的域名/URL（默认 floridahigh.fyi）
+		reverse_proxy https://floridahigh.fyi {
 			header_up Host {upstream_hostport}
 		}
 	}

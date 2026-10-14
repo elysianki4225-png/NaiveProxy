@@ -1,0 +1,38 @@
+# ------------------------------------------------------------------------------
+# 示例文件：由 naiveproxy-install.sh 生成，实际安装时内容按你的机器内存/档位不同。
+# 真实路径: /etc/sysctl.d/99-naiveproxy-accel.conf
+# 生成后立即 sysctl -p 生效；关闭: bash naiveproxy-install.sh accel off
+# 参数含义与原因见 docs/加速与性能.md
+# ------------------------------------------------------------------------------
+# ==============================================================================
+# NaiveProxy 加速参数（自研内核调优模块，非第三方脚本）
+# 由 naiveproxy-install.sh v1.0.0 生成，时间: 2026-10-14 12:23:28，档位: standard
+# 说明: 只调整 Linux 内核网络参数，不安装任何额外软件；无需重启，写入后立即生效。
+#       缓冲上限约为 32 MB（只是上限，空闲时不预分配内存）。
+#       关闭: bash naiveproxy-install.sh accel off     查看: bash naiveproxy-install.sh accel
+# 原理: BBR+fq 拥塞控制 / 加大收发缓冲 / TCP Fast Open / 长连接保活 / MTU 探测 /
+#       扩大半连接与全连接队列，配合 forward_proxy 连接复用（256/16）提升跨境吞吐。
+# ==============================================================================
+net.core.default_qdisc=fq
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.ip_local_port_range=10240 65535
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=8192
+net.core.optmem_max=262144
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384

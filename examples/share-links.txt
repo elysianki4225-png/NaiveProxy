@@ -1,0 +1,2 @@
+naive+https://your-username:your-strong-password@proxy.example.com:443#NaiveProxy-proxy
+naive+quic://your-username:your-strong-password@proxy.example.com:443#NaiveProxy-QUIC-proxy

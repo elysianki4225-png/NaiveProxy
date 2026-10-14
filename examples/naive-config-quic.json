@@ -1,0 +1,4 @@
+{
+  "listen": "socks://127.0.0.1:1080",
+  "proxy": "quic://your-username:your-strong-password@proxy.example.com:443"
+}

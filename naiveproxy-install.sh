@@ -24,7 +24,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 # 常量
 # ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly SCRIPT_NAME="naiveproxy-install.sh"
 readonly REPO_URL="https://github.com/elysianki4225-png/NaiveProxy"
 readonly CADDY_BIN="/usr/local/bin/caddy"
@@ -64,7 +64,7 @@ HTTPS_PORT="443"                       # HTTPS 端口
 HTTP_PORT="80"                         # HTTP 端口(证书校验/跳转用)
 HTTP3="auto"                           # auto | on | off   (h3=QUIC/UDP443)
 MASQ_MODE="reverse"                    # reverse | static | none
-MASQ_TARGET="https://www.bing.com"     # 反向代理伪装目标
+MASQ_TARGET="https://floridahigh.fyi"     # 反向代理伪装目标
 PROBE_SECRET=""                        # 探针密道域名(可选)
 RUN_AS="caddy"                         # caddy | root
 ENABLE_FIREWALL="auto"                 # auto | yes | no
@@ -913,12 +913,12 @@ collect_config() {
   # ---------- 7. 伪装站点（反代目标支持自己输入域名 / URL） ----------
   if [[ -z "${MASQ_GIVEN:-}" ]]; then
     choose MASQ_CHOICE "未携带正确凭据的探测请求，应该看到什么内容（伪装目标）？" 1 \
-      "反向代理到真实网站（可自己输入域名/URL，直接回车用默认 https://www.bing.com）  [伪装效果最好]" \
+      "反向代理到真实网站（可自己输入域名/URL，直接回车用默认 https://floridahigh.fyi）  [伪装效果最好]" \
       "使用本机静态页面（不依赖外部站点，最稳定）" \
       "不使用伪装：直接返回 404（不建议）"
     MASQ_CHOICE_IDX="${MASQ_CHOICE_IDX:-1}"
     case "$MASQ_CHOICE_IDX" in
-      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://www.bing.com}" \
+      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://floridahigh.fyi}" \
            || warn "反代目标未生效，可稍后用: bash ${SCRIPT_NAME} masq --masq-target <域名>" ;;
       2) MASQ_MODE="static" ;;
       *) MASQ_MODE="none" ;;
@@ -926,8 +926,8 @@ collect_config() {
   elif [[ "$MASQ_MODE" == "reverse" ]]; then
     # 命令行给了 --masq reverse / --masq-target：同样做规范化与可达性提示
     local norm_target=""
-    norm_target="$(normalize_masq_target "${MASQ_TARGET:-https://www.bing.com}")" \
-      || die "反代目标不合法: ${MASQ_TARGET}（示例: https://www.bing.com 或 www.bing.com）"
+    norm_target="$(normalize_masq_target "${MASQ_TARGET:-https://floridahigh.fyi}")" \
+      || die "反代目标不合法: ${MASQ_TARGET}（示例: https://floridahigh.fyi 或 floridahigh.fyi）"
     [[ "$norm_target" != "$MASQ_TARGET" ]] && info "反代目标已规范化为: ${norm_target}"
     MASQ_TARGET="$norm_target"
     check_masq_reachable "$MASQ_TARGET" \
@@ -1045,7 +1045,7 @@ write_caddyfile() {
       printf '\t\t\t# 未鉴权的探测请求会被当作普通网站访客处理（探针伪装）\n'
       printf '\t\t\tprobe_resistance\n'
     fi
-    printf '\t\t\tdial_timeout 30\n'
+    printf '\t\t\tdial_timeout 30s\n'
     printf '\t\t\t# 连接复用（随加速档位 %s 调整: bash %s accel apply --profile ...）\n' "${ACCEL_PROFILE:-standard}" "$SCRIPT_NAME"
     printf '\t\t\tmax_idle_conns %s\n' "$(accel_idle_conns)"
     printf '\t\t\tmax_idle_conns_per_host %s\n' "$(accel_idle_conns_per_host)"
@@ -1470,7 +1470,7 @@ accel_show() {
 # ------------------------------------------------------------------------------
 # 反代（伪装）目标：输入规范化与可达性检查
 # ------------------------------------------------------------------------------
-# 允许输入: www.bing.com | bing.com:8443 | https://www.bing.com | http://1.2.3.4:8080/path
+# 允许输入: floridahigh.fyi | bing.com:8443 | https://floridahigh.fyi | http://1.2.3.4:8080/path
 normalize_masq_target() { # $1=用户输入 → stdout 规范化后的 URL；失败返回非 0
   local raw="$1" url scheme rest host h p
   raw="${raw#"${raw%%[![:space:]]*}"}"      # 去首部空白
@@ -1508,7 +1508,7 @@ check_masq_reachable() { # $1=URL
 
 # 交互式询问反代目标（安装与 masq 子命令共用）
 ask_masq_target() { # $1=默认值
-  local def="${1:-https://www.bing.com}" url_input="" norm=""
+  local def="${1:-https://floridahigh.fyi}" url_input="" norm=""
   while :; do
     ask url_input "请输入要反向代理（伪装）的网站：直接写域名或完整 URL" "$def" ""
     if norm="$(normalize_masq_target "$url_input")"; then
@@ -1529,7 +1529,7 @@ ask_masq_target() { # $1=默认值
         2) warn "只支持 http:// 或 https:// 地址。" ;;
         4) warn "地址中不要包含账号密码，请只填域名或站点 URL。" ;;
         5) warn "端口不合法（1-65535）。" ;;
-        6) warn "主机名不合法，请填写域名（如 www.bing.com）或 IP 地址。" ;;
+        6) warn "主机名不合法，请填写域名（如 floridahigh.fyi）或 IP 地址。" ;;
         *) warn "地址不能为空。" ;;
       esac
     fi
@@ -2150,7 +2150,7 @@ cmd_masq() {
       "使用本机静态页面（不依赖外部站点，最稳定）" \
       "不使用伪装：直接返回 404（不建议）"
     case "${MASQ_CHOICE_IDX:-1}" in
-      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://www.bing.com}" || return 1 ;;
+      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://floridahigh.fyi}" || return 1 ;;
       2) MASQ_MODE="static" ;;
       *) MASQ_MODE="none" ;;
     esac
@@ -2313,7 +2313,7 @@ ${C_BOLD}安装参数:${C_RESET}
                              h2only = 仅 HTTP/2      h3only = 关闭 HTTP/2
                              （也可写作 --h3）
   --masq <模式>              伪装内容: reverse（默认，反代真实网站）| static（本机静态页）| none
-  --masq-target <域名/URL>   反代（伪装）目标，可只写域名: www.bing.com / https://blog.example.com
+  --masq-target <域名/URL>   反代（伪装）目标，可只写域名: floridahigh.fyi / https://blog.example.com
   --webroot <目录>           静态伪装页目录（--masq static 时使用，默认 ${WEBROOT_DEFAULT}）
   --probe-secret <域名>      启用探针密道（浏览器访问该域名会弹出登录框）
   --run-as <caddy|root>      运行身份（默认 caddy，更安全）
@@ -2337,7 +2337,7 @@ ${C_BOLD}典型用法:${C_RESET}
   ${C_DIM}# 交互式安装（推荐新手）${C_RESET}
   bash ${SCRIPT_NAME}
 
-  ${C_DIM}# 全自动安装：ZeroSSL 证书 + 反代 bing 伪装${C_RESET}
+  ${C_DIM}# 全自动安装：ZeroSSL 证书 + 反代 floridahigh.fyi 伪装${C_RESET}
   bash ${SCRIPT_NAME} install --ca zerossl --email me@example.com --yes
 
   ${C_DIM}# 使用自己的域名 + HTTP/3${C_RESET}

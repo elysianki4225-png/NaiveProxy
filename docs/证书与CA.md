@@ -172,7 +172,7 @@ sudo bash naiveproxy-install.sh install --ca custom \
 			hide_via
 			probe_resistance
 		}
-		reverse_proxy https://www.bing.com {
+		reverse_proxy https://floridahigh.fyi {
 			header_up Host {upstream_hostport}
 		}
 	}

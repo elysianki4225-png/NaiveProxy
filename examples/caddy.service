@@ -3,7 +3,7 @@
 # 由 naiveproxy-install.sh 自动生成安装的服务单元与此基本一致，
 # 本文件仅作参考；直接使用请把路径/用户改成你自己的环境。
 # ==============================================================================
-# NaiveProxy / Caddy 服务单元（由 naiveproxy-install.sh v1.0.0 生成）
+# NaiveProxy / Caddy 服务单元（由 naiveproxy-install.sh v1.0.1 生成）
 [Unit]
 Description=Caddy web server (NaiveProxy / forwardproxy-naive)
 Documentation=https://github.com/elysianki4225-png/NaiveProxy

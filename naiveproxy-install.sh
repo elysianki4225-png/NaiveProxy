@@ -41,7 +41,8 @@ readonly SERVICE_FILE="/etc/systemd/system/caddy.service"
 readonly WEBROOT_DEFAULT="/var/www/naiveproxy"
 WEBROOT="$WEBROOT_DEFAULT"    # 静态伪装页面根目录（--webroot 覆盖）
 readonly LOG_FILE="/var/log/naiveproxy-install.log"
-readonly SYSCTL_FILE="/etc/sysctl.d/99-naiveproxy.conf"
+readonly SYSCTL_FILE="/etc/sysctl.d/99-naiveproxy.conf"          # 旧版 BBR 参数文件（仅卸载时清理）
+readonly ACCEL_FILE="/etc/sysctl.d/99-naiveproxy-accel.conf"     # 自研加速模块参数文件
 
 # 上游版本（可被 --caddy-version 覆盖）
 readonly FORWARDPROXY_REPO="klzgrad/forwardproxy"
@@ -67,7 +68,11 @@ MASQ_TARGET="https://www.bing.com"     # 反向代理伪装目标
 PROBE_SECRET=""                        # 探针密道域名(可选)
 RUN_AS="caddy"                         # caddy | root
 ENABLE_FIREWALL="auto"                 # auto | yes | no
-ENABLE_BBR="auto"                      # auto | yes | no
+ACCEL_PROFILE="standard"               # off | standard | aggressive（自研加速模块，默认安装）
+ACCEL_APPLIED="no"
+ACCEL_PREV_CC=""                       # 加速前的拥塞控制算法（用于关闭时恢复）
+ACCEL_PREV_QDISC=""                    # 加速前的默认排队规则
+ACCEL_SKIPPED_KEYS=""                  # 当前内核不支持、被跳过的参数
 CADDY_VERSION="${DEFAULT_CADDY_VERSION}"
 INSTALL_METHOD="auto"                  # auto | prebuilt | source | api
 FP_TAG=""                              # forwardproxy 预编译包 tag
@@ -78,6 +83,7 @@ INTERACTIVE="auto"                     # auto | yes | no
 
 # 运行时状态
 OS_ID=""; OS_VERSION=""; OS_CODENAME=""; ARCH=""; CADDY_INSTALL_METHOD=""
+MASQ_GIVEN=""; WEBROOT_GIVEN=""
 QUIET="no"
 UPGRADE_MODE="no"
 
@@ -123,6 +129,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # 交互读取（兼容 curl | bash 场景：优先读 /dev/tty）
 # ------------------------------------------------------------------------------
 can_prompt() {
+  # 输入流已结束（EOF，例如 curl | bash 且已无输入）：不再尝试交互，避免反复空转
+  [[ "${INPUT_EOF:-no}" == "yes" ]] && return 1
   [[ "$ASSUME_YES" == "yes" ]] && return 1      # --yes 表示全部使用默认值
   [[ "$INTERACTIVE" == "no" ]] && return 1
   [[ "$INTERACTIVE" == "yes" ]] && return 0
@@ -147,19 +155,20 @@ _prompt_out() {
 
 _tty_read() {
   local __var="$1"; shift
-  local line
+  local __line
   if [[ "$TTY_OK" == "yes" ]]; then
-    IFS= read -r "$@" line </dev/tty || return 1
+    IFS= read -r "$@" __line </dev/tty || { INPUT_EOF="yes"; return 1; }
   else
-    IFS= read -r "$@" line || return 1
+    # shellcheck disable=SC2034  # INPUT_EOF 供 can_prompt 判断输入流是否已结束
+    IFS= read -r "$@" __line || { INPUT_EOF="yes"; return 1; }
   fi
-  printf -v "$__var" '%s' "$line"
+  printf -v "$__var" '%s' "$__line"
 }
 
 # ask <变量名> <提示语> <默认值> [校验函数]
 ask() {
   local __var="$1" prompt="$2" default="${3:-}" validator="${4:-}"
-  local input
+  local __input
   if ! can_prompt; then
     printf -v "$__var" '%s' "$default"
     return 0
@@ -170,29 +179,30 @@ ask() {
     else
       _prompt_out "${C_CYAN}?${C_RESET} ${prompt} "
     fi
-    _tty_read input || { printf -v "$__var" '%s' "$default"; return 0; }
-    [[ -z "$input" && -n "$default" ]] && input="$default"
-    if [[ -n "$validator" ]] && ! "$validator" "$input"; then
+    # 读取失败（EOF / 无可用终端）时退回默认值，绝不空转
+    _tty_read __input || { printf -v "$__var" '%s' "$default"; return 0; }
+    [[ -z "$__input" && -n "$default" ]] && __input="$default"
+    if [[ -n "$validator" ]] && ! "$validator" "$__input"; then
       err "输入不合法，请重新输入。"
+      if ! can_prompt; then return 1; fi
       continue
     fi
-    printf -v "$__var" '%s' "$input"
+    printf -v "$__var" '%s' "$__input"
     return 0
   done
 }
 
-# ask_yn <提示语> <默认 yes|no>  返回 0=是 1=否
 ask_yn() {
-  local prompt="$1" default="${2:-no}" input suffix
+  local prompt="$1" default="${2:-no}" __input suffix
   if [[ "$ASSUME_YES" == "yes" ]]; then
     [[ "$default" == "yes" ]] && return 0 || return 1
   fi
   can_prompt || { [[ "$default" == "yes" ]] && return 0 || return 1; }
   [[ "$default" == "yes" ]] && suffix="[Y/n]" || suffix="[y/N]"
   _prompt_out "${C_CYAN}?${C_RESET} ${prompt} ${suffix} "
-  _tty_read input || input=""
-  input="${input:-$default}"
-  case "${input,,}" in
+  _tty_read __input || __input=""
+  __input="${__input:-$default}"
+  case "${__input,,}" in
     y|yes|是) return 0 ;;
     *)        return 1 ;;
   esac
@@ -202,7 +212,7 @@ ask_yn() {
 choose() {
   local __var="$1" prompt="$2" default="$3"; shift 3
   local -a options=("$@")
-  local i input
+  local i __input
   if ! can_prompt; then
     printf -v "$__var" '%s' "${options[$((default-1))]}"
     printf -v "${__var}_IDX" '%s' "$default"
@@ -216,14 +226,20 @@ choose() {
   _prompt_out "$menu_text"
   while :; do
     _prompt_out "${C_CYAN}→${C_RESET} 请选择 (默认 ${default}): "
-    _tty_read input || { input="$default"; }
-    input="${input:-$default}"
-    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#options[@]} )); then
-      printf -v "$__var" '%s' "${options[$((input-1))]}"
-      printf -v "${__var}_IDX" '%s' "$input"
+    _tty_read __input || { __input="$default"; }
+    __input="${__input:-$default}"
+    if [[ "$__input" =~ ^[0-9]+$ ]] && (( __input >= 1 && __input <= ${#options[@]} )); then
+      printf -v "$__var" '%s' "${options[$((__input-1))]}"
+      printf -v "${__var}_IDX" '%s' "$__input"
       return 0
     fi
     err "请输入 1-${#options[@]} 之间的数字。"
+    # 输入流已结束（EOF）或无法交互时，直接用默认选项，避免无限循环
+    if ! can_prompt; then
+      printf -v "$__var" '%s' "${options[$((default-1))]}"
+      printf -v "${__var}_IDX" '%s' "$default"
+      return 0
+    fi
   done
 }
 
@@ -894,20 +910,28 @@ collect_config() {
     no|false|0) HTTP3="h2only" ;;
   esac
 
-  # ---------- 7. 伪装站点 ----------
+  # ---------- 7. 伪装站点（反代目标支持自己输入域名 / URL） ----------
   if [[ -z "${MASQ_GIVEN:-}" ]]; then
     choose MASQ_CHOICE "未携带正确凭据的探测请求，应该看到什么内容（伪装目标）？" 1 \
-      "反向代理到真实网站（默认: https://www.bing.com）  [伪装效果最好]" \
-      "自定义反代目标网站（自己输入 URL）" \
+      "反向代理到真实网站（可自己输入域名/URL，直接回车用默认 https://www.bing.com）  [伪装效果最好]" \
       "使用本机静态页面（不依赖外部站点，最稳定）" \
       "不使用伪装：直接返回 404（不建议）"
     MASQ_CHOICE_IDX="${MASQ_CHOICE_IDX:-1}"
     case "$MASQ_CHOICE_IDX" in
-      1) MASQ_MODE="reverse"; MASQ_TARGET="https://www.bing.com" ;;
-      2) MASQ_MODE="reverse"; ask MASQ_TARGET "请输入要反代的网站 URL（含 https://）" "https://www.cloudflare.com" "" ;;
-      3) MASQ_MODE="static" ;;
+      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://www.bing.com}" \
+           || warn "反代目标未生效，可稍后用: bash ${SCRIPT_NAME} masq --masq-target <域名>" ;;
+      2) MASQ_MODE="static" ;;
       *) MASQ_MODE="none" ;;
     esac
+  elif [[ "$MASQ_MODE" == "reverse" ]]; then
+    # 命令行给了 --masq reverse / --masq-target：同样做规范化与可达性提示
+    local norm_target=""
+    norm_target="$(normalize_masq_target "${MASQ_TARGET:-https://www.bing.com}")" \
+      || die "反代目标不合法: ${MASQ_TARGET}（示例: https://www.bing.com 或 www.bing.com）"
+    [[ "$norm_target" != "$MASQ_TARGET" ]] && info "反代目标已规范化为: ${norm_target}"
+    MASQ_TARGET="$norm_target"
+    check_masq_reachable "$MASQ_TARGET" \
+      || warn "本机暂时无法访问 ${MASQ_TARGET}，探测者可能看到 502（详见 docs/运维与排错.md）。"
   fi
 
   export HTTPS_PORT HTTP_PORT
@@ -957,7 +981,7 @@ stop_port_user() {
 # 生成 Caddyfile
 # ------------------------------------------------------------------------------
 write_caddyfile() {
-  section "步骤 5/6 · 生成配置"
+  section "${CADDYFILE_STEP_TITLE:-步骤 5/6 · 生成配置}"
   if [[ -f "$CADDYFILE" && "$FORCE" != "yes" ]]; then
     local bak
     bak="${CADDYFILE}.bak.$(date +%Y%m%d%H%M%S)"
@@ -1022,8 +1046,9 @@ write_caddyfile() {
       printf '\t\t\tprobe_resistance\n'
     fi
     printf '\t\t\tdial_timeout 30\n'
-    printf '\t\t\tmax_idle_conns 128\n'
-    printf '\t\t\tmax_idle_conns_per_host 8\n'
+    printf '\t\t\t# 连接复用（随加速档位 %s 调整: bash %s accel apply --profile ...）\n' "${ACCEL_PROFILE:-standard}" "$SCRIPT_NAME"
+    printf '\t\t\tmax_idle_conns %s\n' "$(accel_idle_conns)"
+    printf '\t\t\tmax_idle_conns_per_host %s\n' "$(accel_idle_conns_per_host)"
     if [[ "$ALLOW_PRIVATE_NETS" == "yes" ]]; then
       printf '\t\t\t# ⚠ 已允许访问内网/回环地址（改动过默认安全策略）\n'
       printf '\t\t\tacl {\n\t\t\t\tallow all\n\t\t\t}\n'
@@ -1178,37 +1203,343 @@ configure_firewall() {
   fi
 }
 
-enable_bbr() {
-  local do_it="$ENABLE_BBR"
-  if [[ "$do_it" == "auto" ]]; then
-    local cur; cur="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    if [[ "$cur" == "bbr" ]]; then
-      info "系统已启用 BBR。"
-      return 0
-    fi
-    if ! can_prompt; then do_it="no"; else
-      if ask_yn "是否启用 BBR 拥塞控制算法（可显著提升跨境传输速度，需要修改内核参数）？" "yes"; then do_it="yes"; else do_it="no"; fi
-    fi
-  fi
-  [[ "$do_it" == "yes" ]] || return 0
+# ------------------------------------------------------------------------------
+# 自研加速模块（纯内核参数调优 + 服务端连接复用，不下载/不执行任何第三方脚本）
+#
+#   设计思路（服务端视角，NaiveProxy = HTTP/2 或 HTTP/3 上的长连接隧道）：
+#     1) 拥塞控制：BBR + fq 排队 —— 在丢包链路上比 cubic 吞吐高得多、排队延迟更低；
+#        官方预编译包里的 QUIC-BBRv1 补丁让 HTTP/3 的 BBR 也带 v1 特性。
+#     2) 收发缓冲：按内存自动选择 8/16/32/64MB —— 跨境长肥管道（高 BDP）不再被
+#        socket 缓冲卡住；Go 的 quic-go 也会按 rmem_max/wmem_max 设置 UDP 缓冲。
+#     3) 握手与复用：TCP Fast Open、tcp_tw_reuse、扩大本地端口范围 —— 降低连接建立成本。
+#     4) 长连接：关闭空闲后重新慢启动、缩短 keepalive 探测间隔 —— 代理长连接不抖动。
+#     5) 队列与并发：somaxconn / netdev_max_backlog / syn backlog —— 高并发不掉包。
+#     6) MTU 自动探测：隧道/PPPoE 环境避免 MTU 黑洞导致的大包丢失。
+#     7) 应用层：forward_proxy 的空闲连接复用参数随档位放大（见 write_caddyfile）。
+#
+#   档位: off（关闭）| standard（默认，安全通用）| aggressive（激进，内存 ≥1.5G 才加大缓冲）
+# ------------------------------------------------------------------------------
+accel_profile_valid() { case "${1:-}" in off|standard|aggressive) return 0 ;; *) return 1 ;; esac; }
 
-  if ! modprobe tcp_bbr 2>/dev/null && ! grep -q tcp_bbr /proc/modules 2>/dev/null; then
-    warn "当前内核不支持 BBR（可能需要升级内核），已跳过。"
+accel_mem_mb() { awk '/^MemTotal:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null || echo 1024; }
+
+accel_key_available() { [[ -e "/proc/sys/${1//./\/}" ]]; }
+accel_val_now() { local v; v="$(sysctl -n "$1" 2>/dev/null || true)"; printf '%s' "$v" | tr -s '[:space:]' ' '; }
+
+# 原始计划（可能含重复键，后出现的覆盖先出现的）
+accel_plan_raw() {
+  local profile="$1" mem big rdef
+  mem="$(accel_mem_mb)"
+  big=33554432                                          # 32MB
+  rdef=262144
+  if (( mem < 1024 )); then big=16777216; fi            # <1GB 内存 → 16MB
+  if (( mem < 512 ));  then big=8388608; rdef=131072; fi # <512MB 内存 → 8MB
+
+  cat <<ACCEL_EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.ip_local_port_range=10240 65535
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=8192
+net.core.optmem_max=262144
+net.core.rmem_default=${rdef}
+net.core.wmem_default=${rdef}
+net.core.rmem_max=${big}
+net.core.wmem_max=${big}
+net.ipv4.tcp_rmem=4096 ${rdef} ${big}
+net.ipv4.tcp_wmem=4096 ${rdef} ${big}
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+ACCEL_EOF
+
+  if [[ "$profile" == "aggressive" ]]; then
+    local big2=$(( big * 2 ))
+    # 内存不足时只加大队列，不加大缓冲（避免 OOM 风险）
+    if (( mem < 1536 )); then big2="$big"; fi
+    cat <<ACCEL_EOF
+net.core.somaxconn=32768
+net.ipv4.tcp_max_syn_backlog=32768
+net.core.netdev_max_backlog=32768
+net.core.rmem_max=${big2}
+net.core.wmem_max=${big2}
+net.ipv4.tcp_rmem=4096 1048576 ${big2}
+net.ipv4.tcp_wmem=4096 1048576 ${big2}
+net.ipv4.tcp_max_tw_buckets=131072
+ACCEL_EOF
+  fi
+}
+
+# 去重（保留最后一次出现的值，同时保持首次出现的顺序）
+accel_dedupe() {
+  awk -F= '{ if (!($1 in seen)) { order[n++]=$1; seen[$1]=1 } v[$1]=$2 }
+           END { for (i=0;i<n;i++) printf "%s=%s\n", order[i], v[order[i]] }'
+}
+
+# 最终计划：去重 + 剔除当前内核不支持的键（被剔除的记进 ACCEL_SKIPPED_KEYS）
+accel_plan() {
+  local profile="$1" line key cc_avail
+  ACCEL_SKIPPED_KEYS=""
+  cc_avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
+  # 若 BBR 还没出现在可用列表里，尝试加载模块后重新读取（内核自带，无需额外安装）
+  if [[ "$cc_avail" != *bbr* ]] && have modprobe; then
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    cc_avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
+  fi
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    [[ -z "$key" ]] && continue
+    if ! accel_key_available "$key"; then
+      ACCEL_SKIPPED_KEYS+="${key} "
+      continue
+    fi
+    # BBR 不可用时（内核过旧/未加载模块）跳过拥塞控制项
+    if [[ "$key" == "net.ipv4.tcp_congestion_control" && "${line#*=}" == "bbr" && "$cc_avail" != *bbr* ]]; then
+      ACCEL_SKIPPED_KEYS+="${key} "
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < <(accel_plan_raw "$profile" | accel_dedupe)
+}
+
+# 连接复用参数（随档位放大；write_caddyfile 也会调用）
+accel_idle_conns() {
+  case "${ACCEL_PROFILE:-standard}" in
+    aggressive) echo 512 ;;
+    off)        echo 128 ;;
+    *)          echo 256 ;;
+  esac
+}
+accel_idle_conns_per_host() {
+  case "${ACCEL_PROFILE:-standard}" in
+    aggressive) echo 32 ;;
+    off)        echo 8 ;;
+    *)          echo 16 ;;
+  esac
+}
+
+accel_status_line() {
+  local p="${ACCEL_PROFILE:-standard}"
+  if [[ "$p" == "off" ]]; then printf '已关闭'; return 0; fi
+  printf '%s（拥塞控制=%s 排队=%s 复用=%s/%s）' \
+    "$p" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)" \
+    "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)" \
+    "$(accel_idle_conns)" "$(accel_idle_conns_per_host)"
+}
+
+accel_apply() { # $1=档位（默认取 ACCEL_PROFILE）
+  local profile="${1:-${ACCEL_PROFILE:-standard}}"
+  accel_profile_valid "$profile" || die "加速档位不合法: ${profile}（可选 off | standard | aggressive）"
+  if [[ "$profile" == "off" ]]; then accel_disable; return 0; fi
+
+  step "启用自研加速模块（档位: ${profile}）"
+
+  # 记录原始值，便于 accel off 时恢复
+  ACCEL_PREV_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  ACCEL_PREV_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+  # 加载必要内核模块（Debian 11+ / Ubuntu 20.04+ 内核自带）
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  modprobe sch_fq  >/dev/null 2>&1 || true
+
+  local plan; plan="$(accel_plan "$profile")"
+  if [[ -z "$plan" ]]; then
+    warn "当前内核没有可调优的网络参数（可能运行在受限容器中），已跳过加速模块。"
+    ACCEL_PROFILE="off"; ACCEL_APPLIED="no"
     return 0
   fi
-  {
-    printf '# NaiveProxy 安装脚本添加：BBR 拥塞控制\n'
-    printf 'net.core.default_qdisc=fq\n'
-    printf 'net.ipv4.tcp_congestion_control=bbr\n'
-    printf 'net.core.somaxconn=8192\n'
-  } >"$SYSCTL_FILE"
-  sysctl --system >/dev/null 2>&1 || warn "应用 sysctl 失败，请手动执行 sysctl --system"
-  local now; now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-  if [[ "$now" == "bbr" ]]; then
-    ok "BBR 已启用（当前拥塞控制: ${now}）。"
-  else
-    warn "BBR 启用未生效（当前: ${now}），可能是内核不支持。"
+
+  # 与其它调优文件的冲突提示
+  local conflict=""
+  conflict="$(grep -rlsE 'net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.core\.rmem_max' \
+              /etc/sysctl.conf /etc/sysctl.d 2>/dev/null | grep -v "^${ACCEL_FILE}$" | head -n 3 || true)"
+  if [[ -n "$conflict" ]]; then
+    warn "检测到其它文件也在设置网络参数：$(printf '%s' "$conflict" | tr '\n' ' ')"
+    hint "${ACCEL_FILE} 以 99- 前缀命名，会最后加载，冲突时通常以本模块为准。"
   fi
+
+  local big_mb=""
+  big_mb="$(printf '%s\n' "$plan" | awk -F= '$1=="net.core.rmem_max"{printf "%d", $2/1048576}')"
+  [[ -n "$big_mb" ]] || big_mb="?"
+
+  {
+    printf '# ==============================================================================\n'
+    printf '# NaiveProxy 加速参数（自研内核调优模块，非第三方脚本）\n'
+    printf '# 由 %s v%s 生成，时间: %s，档位: %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" \
+           "$(date '+%Y-%m-%d %H:%M:%S')" "$profile"
+    printf '# 说明: 只调整 Linux 内核网络参数，不安装任何额外软件；无需重启，写入后立即生效。\n'
+    printf '#       缓冲上限约为 %s MB（只是上限，空闲时不预分配内存）。\n' "$big_mb"
+    printf '#       关闭: bash %s accel off     查看: bash %s accel\n' "$SCRIPT_NAME" "$SCRIPT_NAME"
+    printf '# 原理: BBR+fq 拥塞控制 / 加大收发缓冲 / TCP Fast Open / 长连接保活 / MTU 探测 /\n'
+    printf '#       扩大半连接与全连接队列，配合 forward_proxy 连接复用（%s/%s）提升跨境吞吐。\n' \
+           "$(accel_idle_conns)" "$(accel_idle_conns_per_host)"
+    printf '# ==============================================================================\n'
+    printf '%s\n' "$plan"
+  } >"$ACCEL_FILE" || die "写入 ${ACCEL_FILE} 失败。"
+
+  if sysctl -q -p "$ACCEL_FILE" >>"$LOG_FILE" 2>&1; then
+    :
+  else
+    warn "sysctl 应用失败（部分受限环境需要 root 或不允许写入），已保留参数文件，重启后由 systemd-sysctl 生效。"
+  fi
+
+  # 逐项校验
+  local line key val cur okn=0 badn=0 bad_list=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; val="${line#*=}"
+    cur="$(accel_val_now "$key")"
+    if [[ "$cur" == "$(printf '%s' "$val" | tr -s '[:space:]' ' ')" ]]; then
+      okn=$((okn+1))
+    else
+      badn=$((badn+1)); bad_list+="${key} "
+    fi
+  done <<<"$plan"
+
+  ACCEL_PROFILE="$profile"; ACCEL_APPLIED="yes"
+  if (( badn == 0 )); then
+    ok "加速模块已生效（${okn} 项内核参数全部匹配）。"
+  else
+    warn "加速模块已写入（${okn} 项已生效，${badn} 项未生效：${bad_list}）"
+    hint "受限容器/虚拟化环境可能不允许修改这些参数；参数文件仍会在系统重启后由 systemd-sysctl 再尝试一次。"
+  fi
+  if [[ -n "$ACCEL_SKIPPED_KEYS" ]]; then
+    info "当前内核不支持的参数已跳过：${ACCEL_SKIPPED_KEYS}"
+  fi
+  info "内核现状 → 拥塞控制=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)，排队规则=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)，连接复用=$(accel_idle_conns)/$(accel_idle_conns_per_host)"
+  return 0
+}
+
+accel_disable() {
+  step "关闭自研加速模块"
+  local prev_cc="${ACCEL_PREV_CC:-}" prev_qd="${ACCEL_PREV_QDISC:-}"
+  if [[ -f "$ACCEL_FILE" ]]; then
+    if rm -f "$ACCEL_FILE"; then ok "已删除 ${ACCEL_FILE}"; else warn "删除 ${ACCEL_FILE} 失败。"; fi
+  else
+    info "${ACCEL_FILE} 不存在，无需删除。"
+  fi
+  local cur_cc cur_qd tgt_cc tgt_qd
+  cur_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  cur_qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  tgt_cc="${prev_cc:-cubic}";     [[ "$tgt_cc" == "bbr" ]] && tgt_cc="cubic"
+  tgt_qd="${prev_qd:-fq_codel}";  [[ "$tgt_qd" == "fq" ]] && tgt_qd="fq_codel"
+  if [[ "$cur_cc" == "bbr" ]]; then
+    if sysctl -q -w "net.ipv4.tcp_congestion_control=${tgt_cc}" >>"$LOG_FILE" 2>&1; then
+      info "拥塞控制已恢复为 ${tgt_cc}。"
+    else
+      hint "恢复拥塞控制失败，可手动执行: sysctl -w net.ipv4.tcp_congestion_control=${tgt_cc}"
+    fi
+  fi
+  if [[ "$cur_qd" == "fq" ]]; then
+    if sysctl -q -w "net.core.default_qdisc=${tgt_qd}" >>"$LOG_FILE" 2>&1; then
+      info "排队规则已恢复为 ${tgt_qd}。"
+    else
+      hint "恢复排队规则失败，可手动执行: sysctl -w net.core.default_qdisc=${tgt_qd}"
+    fi
+  fi
+  ACCEL_PROFILE="off"; ACCEL_APPLIED="no"
+  ok "加速模块已关闭（下次安装会自动重新启用）。"
+}
+
+accel_show() {
+  section "加速模块状态（自研内核调优）"
+  local applied_msg="未应用"
+  [[ "${ACCEL_APPLIED:-no}" == "yes" ]] && applied_msg="已应用"
+  printf '%-26s %s\n' "档位:" "${ACCEL_PROFILE:-standard}（${applied_msg}）"
+  printf '%-26s %s\n' "参数文件:" "$( [[ -f "$ACCEL_FILE" ]] && echo "$ACCEL_FILE" || echo "不存在（未启用）" )"
+  printf '%-26s %s\n' "拥塞控制:" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)（可用: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo 未知)）"
+  printf '%-26s %s\n' "排队规则:" "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
+  printf '%-26s %s\n' "收发缓冲上限:" "rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo ?)  wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo ?)"
+  printf '%-26s %s\n' "TCP Fast Open:" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 未知)"
+  printf '%-26s %s\n' "队列(syn/somaxconn):" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo ?) / $(sysctl -n net.core.somaxconn 2>/dev/null || echo ?)"
+  printf '%-26s %s\n' "连接复用(forward_proxy):" "$(accel_idle_conns) 空闲连接 / 每主机 $(accel_idle_conns_per_host)"
+  printf '%-26s %s\n' "本机内存:" "$(accel_mem_mb) MB"
+  blank
+  info "切换档位: bash ${SCRIPT_NAME} accel apply --profile aggressive"
+  info "关闭模块: bash ${SCRIPT_NAME} accel off"
+}
+
+# ------------------------------------------------------------------------------
+# 反代（伪装）目标：输入规范化与可达性检查
+# ------------------------------------------------------------------------------
+# 允许输入: www.bing.com | bing.com:8443 | https://www.bing.com | http://1.2.3.4:8080/path
+normalize_masq_target() { # $1=用户输入 → stdout 规范化后的 URL；失败返回非 0
+  local raw="$1" url scheme rest host h p
+  raw="${raw#"${raw%%[![:space:]]*}"}"      # 去首部空白
+  raw="${raw%"${raw##*[![:space:]]}"}"      # 去尾部空白
+  [[ -n "$raw" ]] || return 1
+  if [[ "$raw" == *"://"* ]]; then url="$raw"; else url="https://${raw}"; fi
+  scheme="${url%%://*}"
+  [[ "$scheme" == "http" || "$scheme" == "https" ]] || return 2
+  rest="${url#*://}"
+  rest="${rest%%\?*}"; rest="${rest%%#*}"
+  if [[ "$rest" == */* ]]; then
+    host="${rest%%/*}"
+  else
+    host="$rest"
+  fi
+  [[ -n "$host" ]] || return 3
+  [[ "$host" == *"@"* ]] && return 4
+  h="$host"; p=""
+  if [[ "$host" == *:* ]]; then h="${host%%:*}"; p="${host##*:}"; fi
+  if [[ -n "$p" ]]; then valid_port "$p" || return 5; fi
+  if ! valid_domain "$h" && ! valid_ipv4 "$h"; then return 6; fi
+  printf '%s://%s\n' "$scheme" "$host"
+}
+
+# 本机能否访问该伪装站点（探测者看到 502 反而更可疑，所以提前提示）
+check_masq_reachable() { # $1=URL
+  local url="$1" code=""
+  code="$(curl -s -o /dev/null -m 6 -w '%{http_code}' -A "Mozilla/5.0 (compatible; ${SCRIPT_NAME})" "$url" 2>/dev/null || true)"
+  if [[ -z "$code" || "$code" == "000" ]]; then
+    # 目标证书不被系统信任时重试一次
+    code="$(curl -s -k -o /dev/null -m 5 -w '%{http_code}' -A "Mozilla/5.0 (compatible; ${SCRIPT_NAME})" "$url" 2>/dev/null || true)"
+  fi
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
+# 交互式询问反代目标（安装与 masq 子命令共用）
+ask_masq_target() { # $1=默认值
+  local def="${1:-https://www.bing.com}" url_input="" norm=""
+  while :; do
+    ask url_input "请输入要反向代理（伪装）的网站：直接写域名或完整 URL" "$def" ""
+    if norm="$(normalize_masq_target "$url_input")"; then
+      MASQ_TARGET="$norm"
+      [[ "$norm" != "$url_input" ]] && info "已规范化为: ${norm}"
+      if ! check_masq_reachable "$norm"; then
+        warn "本机暂时无法访问 ${norm}（超时/被拦截/证书异常）。"
+        hint "伪装站点不可达时，探测者会看到 502，比伪装成普通网站更可疑；建议换成本机能正常访问的站点，或用静态页伪装。"
+        if can_prompt && ! ask_yn "仍然使用该地址？" "no"; then
+          continue
+        fi
+      else
+        ok "伪装站点可访问: ${norm}"
+      fi
+      return 0
+    else
+      case "$?" in
+        2) warn "只支持 http:// 或 https:// 地址。" ;;
+        4) warn "地址中不要包含账号密码，请只填域名或站点 URL。" ;;
+        5) warn "端口不合法（1-65535）。" ;;
+        6) warn "主机名不合法，请填写域名（如 www.bing.com）或 IP 地址。" ;;
+        *) warn "地址不能为空。" ;;
+      esac
+    fi
+    if ! can_prompt; then
+      # 非交互模式：保持默认目标，不让安装因为一个地址填错而中断
+      MASQ_TARGET="$def"
+      warn "非交互模式：反代目标仍使用 ${MASQ_TARGET}"
+      return 0
+    fi
+  done
 }
 
 # ------------------------------------------------------------------------------
@@ -1311,6 +1642,8 @@ verify_masquerade() {
 write_state_file() {
   local vars=(DOMAIN PUBLIC_IP DOMAIN_PREFIX PROXY_USER PROXY_PASS HTTPS_PORT HTTP_PORT
               ACME_EMAIL CA_MODE ACME_CA_URL EAB_KID EAB_HMAC HTTP3 MASQ_MODE MASQ_TARGET
+              WEBROOT ALLOW_PRIVATE_NETS
+              ACCEL_PROFILE ACCEL_APPLIED ACCEL_PREV_CC ACCEL_PREV_QDISC
               RUN_AS PROBE_SECRET CADDY_INSTALL_METHOD CADDY_VERSION STATE_SCRIPT_VERSION INSTALL_DATE)
   # shellcheck disable=SC2034  # 下面两个变量通过 ${!v} 间接读取并写入状态文件
   STATE_SCRIPT_VERSION="$SCRIPT_VERSION"
@@ -1326,7 +1659,7 @@ write_state_file() {
     done
   } >>"$STATE_FILE"
   chmod 0600 "$STATE_FILE"
-  ok "安装信息已保存到 ${STATE_FILE}"
+  [[ "${1:-}" == "quiet" ]] || ok "安装信息已保存到 ${STATE_FILE}"
 }
 
 load_state_file() {
@@ -1533,6 +1866,7 @@ print_summary() {
   printf '  伪装站点       : %s\n' "$masq_text"
   printf '  协议支持       : %s\n' "$(case "$HTTP3" in h2only) echo "HTTP/2 (H2)" ;; h3only) echo "HTTP/3 (QUIC)";; *) echo "HTTP/2 + HTTP/3" ;; esac)"
   printf '  证书 CA        : %s\n' "${CA_MODE}${ACME_CA_URL:+ (${ACME_CA_URL})}"
+  printf '  加速模块       : %s\n' "$(accel_status_line)"
   printf '  安装方式       : %s\n' "${CADDY_INSTALL_METHOD:-未知}"
   blank
   printf '%s\n' "${C_BOLD}【1】官方 naive 客户端 config.json（保存为 config.json 后与 naive 放在同目录）${C_RESET}"
@@ -1554,6 +1888,8 @@ print_summary() {
   printf '  服务端配置     : %s\n' "$CADDYFILE"
   printf '  服务管理       : systemctl {status|restart|stop|start} caddy\n'
   printf '  查看日志       : journalctl -u caddy -f\n'
+  printf '  换伪装站点     : bash %s masq --masq-target <域名或URL>\n' "$SCRIPT_NAME"
+  printf '  加速模块       : bash %s accel    （档位 %s，off 可一键还原）\n' "$SCRIPT_NAME" "${ACCEL_PROFILE:-standard}"
   printf '  再次查看节点   : bash %s info   （或 bash %s menu）\n' "$SCRIPT_NAME" "$SCRIPT_NAME"
   blank
   printf '%s\n' "${C_YELLOW}【重要提醒】${C_RESET}"
@@ -1643,7 +1979,8 @@ cmd_install() {
   fi
 
   configure_firewall
-  enable_bbr
+  accel_apply "$ACCEL_PROFILE"      # 自研加速模块（默认开启，无需交互）
+  write_state_file quiet            # 回写加速档位与应用前的内核参数
   generate_client_files
 
   print_summary
@@ -1664,6 +2001,11 @@ cmd_status() {
   issuer="$(timeout 8 openssl s_client -connect "127.0.0.1:${HTTPS_PORT}" -servername "$DOMAIN" </dev/null 2>/dev/null \
             | openssl x509 -noout -issuer -enddate 2>/dev/null | tr '\n' ' ' || true)"
   printf '%-28s %s\n' "当前证书:" "${issuer:-未签发}"
+  local masq_line="无（返回 404）"
+  if [[ "$MASQ_MODE" == "reverse" ]]; then masq_line="反向代理 → ${MASQ_TARGET}"
+  elif [[ "$MASQ_MODE" == "static" ]]; then masq_line="本机静态页面 ${WEBROOT}"; fi
+  printf '%-28s %s\n' "伪装内容:" "$masq_line"
+  printf '%-28s %s\n' "加速模块:" "$(accel_status_line)"
   printf '%-28s %s\n' "配置目录:" "$CLIENT_DIR"
   printf '%-28s %s\n' "状态文件:" "$STATE_FILE"
 }
@@ -1740,6 +2082,7 @@ cmd_renew() {
 
 cmd_uninstall() {
   require_root
+  load_state_file >/dev/null 2>&1 || true      # 取回 WEBROOT / 加速档位等设置
   section "卸载 NaiveProxy / Caddy"
   local remove_all="no"
   if confirm_danger "将停止服务并删除配置、证书与客户端信息，确定卸载？"; then remove_all="yes"; else
@@ -1755,6 +2098,8 @@ cmd_uninstall() {
     systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
     local had_sysctl="no"
     [[ -f "$SYSCTL_FILE" ]] && had_sysctl="yes"
+    # 自研加速模块：删除参数文件并恢复原有拥塞控制/排队规则
+    if [[ -f "$ACCEL_FILE" ]]; then accel_disable; fi
     rm -rf "$CADDY_ETC" "$CADDY_HOME" "$WEBROOT"
     rm -f "$SYSCTL_FILE"
     warn "已删除: ${CADDY_ETC} ${CADDY_HOME} ${WEBROOT}"
@@ -1777,6 +2122,110 @@ cmd_uninstall() {
   fi
 }
 
+cmd_masq() {
+  require_root
+  # 注意: load_state_file 会用安装时保存的值覆盖变量，所以先记下命令行显式给出的值
+  local cli_masq_given="${MASQ_GIVEN:-}" cli_masq_mode="$MASQ_MODE" cli_masq_target="${MASQ_TARGET:-}"
+  local cli_webroot="$WEBROOT" cli_webroot_given="${WEBROOT_GIVEN:-}"
+  require_installed
+  if [[ "$cli_masq_given" == "yes" ]]; then
+    MASQ_GIVEN="yes"; MASQ_MODE="$cli_masq_mode"
+    [[ -n "$cli_masq_target" ]] && MASQ_TARGET="$cli_masq_target"
+  fi
+  if [[ "$cli_webroot_given" == "yes" ]]; then WEBROOT="$cli_webroot"; fi
+  section "修改伪装（反向代理）内容"
+  local cur="无伪装（返回 404）"
+  if [[ "$MASQ_MODE" == "reverse" ]]; then cur="反向代理 → ${MASQ_TARGET}"
+  elif [[ "$MASQ_MODE" == "static" ]]; then cur="本机静态页面 ${WEBROOT}"; fi
+  printf '  当前伪装: %s\n\n' "$cur"
+
+  if [[ -z "${MASQ_GIVEN:-}" ]]; then
+    if ! can_prompt; then
+      warn "非交互模式且未指定 --masq / --masq-target，未做任何修改。"
+      hint "示例: bash ${SCRIPT_NAME} masq --masq-target https://www.example.com --yes"
+      return 0
+    fi
+    choose MASQ_CHOICE "请选择新的伪装方式：" 1 \
+      "反向代理到真实网站（可自己输入域名/URL，回车沿用当前目标）" \
+      "使用本机静态页面（不依赖外部站点，最稳定）" \
+      "不使用伪装：直接返回 404（不建议）"
+    case "${MASQ_CHOICE_IDX:-1}" in
+      1) MASQ_MODE="reverse"; ask_masq_target "${MASQ_TARGET:-https://www.bing.com}" || return 1 ;;
+      2) MASQ_MODE="static" ;;
+      *) MASQ_MODE="none" ;;
+    esac
+  elif [[ "$MASQ_MODE" == "reverse" ]]; then
+    local norm=""
+    norm="$(normalize_masq_target "${MASQ_TARGET:-}")" || die "反代目标不合法: ${MASQ_TARGET}"
+    MASQ_TARGET="$norm"
+    check_masq_reachable "$MASQ_TARGET" || warn "本机暂时无法访问 ${MASQ_TARGET}，探测者可能看到 502。"
+  fi
+
+  if [[ "$MASQ_MODE" == "static" ]]; then
+    mkdir -p "$WEBROOT" 2>/dev/null || warn "创建 ${WEBROOT} 失败。"
+    write_static_page
+  fi
+
+  # 重新生成 Caddyfile（会先备份原文件）并校验
+  CADDYFILE_STEP_TITLE="重新生成服务端配置" write_caddyfile
+  if ! env HOME="$CADDY_HOME" XDG_DATA_HOME="${CADDY_HOME}/.local/share" XDG_CONFIG_HOME="${CADDY_HOME}/.config" \
+        "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile >>"$LOG_FILE" 2>&1; then
+    err "新配置校验失败，已回滚到最近的备份。"
+    local last_bak=""
+    last_bak="$(find "$(dirname "$CADDYFILE")" -maxdepth 1 -name "$(basename "$CADDYFILE").bak.*" -printf '%T@ %p\n' 2>/dev/null \
+                | sort -rn | head -n1 | cut -d' ' -f2- || true)"
+    if [[ -n "$last_bak" ]]; then
+      cp -f "$last_bak" "$CADDYFILE"
+      info "已回滚: ${last_bak} → ${CADDYFILE}"
+    fi
+    return 1
+  fi
+  ok "Caddyfile 校验通过。"
+  if systemctl reload "$SERVICE_NAME" >>"$LOG_FILE" 2>&1; then
+    ok "配置已热重载（reload），无需重启、不断开现有连接。"
+  else
+    warn "reload 失败，改为重启服务。"
+    systemctl restart "$SERVICE_NAME" >>"$LOG_FILE" 2>&1 || true
+  fi
+  verify_masquerade "$DOMAIN" "$HTTPS_PORT"
+  write_state_file
+  ok "伪装内容已更新。"
+  blank
+  cmd_status
+}
+
+cmd_accel() {
+  require_root
+  load_state_file >/dev/null 2>&1 || true
+  local sub="${1:-status}"
+  [[ $# -gt 0 ]] && shift
+  # 允许省略 apply：bash script accel --profile aggressive
+  if [[ "$sub" == -* ]]; then
+    set -- "$sub" "$@"
+    sub="apply"
+  fi
+  case "$sub" in
+    status|show|"") accel_show; return 0 ;;
+    apply|on|enable)
+      local profile="${ACCEL_PROFILE:-standard}"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --profile|-p)
+            if [[ $# -ge 2 ]]; then profile="$2"; shift 2; else shift; fi ;;
+          off|standard|aggressive) profile="$1"; shift ;;
+          *) shift ;;
+        esac
+      done
+      accel_apply "$profile"
+      ;;
+    off|disable) accel_disable ;;
+    *) warn "未知参数: ${sub}"; hint "用法: bash ${SCRIPT_NAME} accel [status|apply [--profile off|standard|aggressive]|off]"; return 1 ;;
+  esac
+  if [[ -f "$STATE_FILE" ]]; then write_state_file >/dev/null 2>&1 || true; fi
+  blank
+  accel_show
+}
+
 cmd_menu() {
   require_root
   while :; do
@@ -1784,6 +2233,7 @@ cmd_menu() {
     if load_state_file >/dev/null 2>&1; then
       printf '  当前节点: %s:%s  （用户名 %s）\n' "${DOMAIN:-?}" "${HTTPS_PORT:-?}" "${PROXY_USER:-?}"
       printf '  伪装目标: %s\n' "${MASQ_TARGET:-${MASQ_MODE:-?}}"
+      printf '  加速模块: %s\n' "$(accel_status_line)"
       printf '  服务状态: %s\n' "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo 未运行)"
     else
       printf '  %s\n' "未检测到安装记录（尚未安装）"
@@ -1795,7 +2245,8 @@ cmd_menu() {
   3) 显示节点信息 / 客户端配置         9) 强制重新申请证书
   4) 重启服务                         10) 卸载
   5) 停止服务                         11) 查看当前 Caddyfile
-  6) 启动服务                          0) 退出
+  6) 启动服务                         12) 修改伪装（反代）目标
+  13) 加速模块（查看 / 切换档位）       0) 退出
 MENU
     _prompt_out "${C_CYAN}→ 请输入选项: ${C_RESET}"
     local choice=""
@@ -1814,6 +2265,8 @@ MENU
       11)
         if [[ -f "$CADDYFILE" ]]; then blank; sed 's/^/  /' "$CADDYFILE"
         else warn "未找到 ${CADDYFILE}"; fi ;;
+      12) cmd_masq ;;
+      13) cmd_accel status ;;
       0|q|Q|"") info "已退出。"; return 0 ;;
       *) warn "无效的选项: ${choice}" ;;
     esac
@@ -1835,6 +2288,8 @@ ${C_BOLD}命令:${C_RESET}
   info         重新打印节点信息 / 客户端配置
   start|stop|restart    启停服务
   log [N|-f]   查看日志（默认最近 120 行，-f 实时跟踪）
+  masq         修改伪装（反向代理目标 / 静态页 / 关闭伪装）
+  accel        自研加速模块：status（默认）| apply [--profile ...] | off
   update       更新 Caddy 到最新版（保留配置）
   renew        强制重新申请证书（会消耗 CA 配额）
   uninstall    卸载
@@ -1858,12 +2313,14 @@ ${C_BOLD}安装参数:${C_RESET}
                              h2only = 仅 HTTP/2      h3only = 关闭 HTTP/2
                              （也可写作 --h3）
   --masq <模式>              伪装内容: reverse（默认，反代真实网站）| static（本机静态页）| none
-  --masq-target <URL>        反代目标，例如 https://www.bing.com 或你自己的博客
+  --masq-target <域名/URL>   反代（伪装）目标，可只写域名: www.bing.com / https://blog.example.com
   --webroot <目录>           静态伪装页目录（--masq static 时使用，默认 ${WEBROOT_DEFAULT}）
   --probe-secret <域名>      启用探针密道（浏览器访问该域名会弹出登录框）
   --run-as <caddy|root>      运行身份（默认 caddy，更安全）
   --firewall <auto|yes|no>   是否自动放行防火墙端口（默认 auto）
-  --bbr <auto|yes|no>        是否启用 BBR（默认 auto=询问）
+  --accel <档位>             自研加速模块（默认 standard=安装时自动启用，无需干预）
+                             off = 不启用并恢复内核默认 | aggressive = 更激进（内存≥1.5G）
+  --bbr <auto|yes|no>        兼容旧参数: auto/yes → --accel standard，no → --accel off
   --install-method <方式>    auto（默认）| prebuilt（预编译）| source（源码编译）| api（官方在线构建）
   --caddy-version <版本>     指定 Caddy 版本（默认 ${DEFAULT_CADDY_VERSION}）
   --fp-tag <tag>             指定 forwardproxy 预编译包 tag（默认自动取最新）
@@ -1892,10 +2349,20 @@ ${C_BOLD}典型用法:${C_RESET}
   ${C_DIM}# 查看节点信息${C_RESET}
   bash ${SCRIPT_NAME} info
 
+  ${C_DIM}# 换一个反代（伪装）网站，热重载不中断连接${C_RESET}
+  bash ${SCRIPT_NAME} masq --masq-target www.cloudflare.com
+
+  ${C_DIM}# 加速模块：查看状态 / 切换档位 / 关闭并恢复内核默认${C_RESET}
+  bash ${SCRIPT_NAME} accel
+  bash ${SCRIPT_NAME} accel apply --profile aggressive
+  bash ${SCRIPT_NAME} accel off
+
 ${C_BOLD}说明:${C_RESET}
   * 脚本会安装 caddy-forwardproxy-naive（klzgrad/forwardproxy 的 naive 分支），
     它是唯一带 NaiveProxy 填充层（padding）的服务端实现。
   * 只支持 Debian 11+/Ubuntu 20.04+，需要 root 权限。
+  * 安装时会自动启用「自研加速模块」= 纯内核参数调优（BBR+fq、收发缓冲、TFO、MTU 探测…）
+    + forward_proxy 连接复用放大，不下载、不执行任何第三方脚本，可用 accel off 一键还原。
   * 生产环境建议使用自己的域名 + 已解析的 A 记录；nip.io 适合临时测试。
 USAGE_EOF
 }
@@ -1940,16 +2407,29 @@ parse_args() {
           *) die "未知的 --masq 取值: $2（可选: reverse | static | none）" ;;
         esac
         shift 2 ;;
-      --masq-target) MASQ_MODE="reverse"; MASQ_TARGET="$2"; shift 2 ;;
+      --masq-target)
+        MASQ_GIVEN="yes"; MASQ_MODE="reverse"; MASQ_TARGET="$2"; shift 2 ;;
       --probe-secret) PROBE_SECRET="$2"; shift 2 ;;
       --run-as)      RUN_AS="$2"; shift 2 ;;
       --firewall)    ENABLE_FIREWALL="$2"; shift 2 ;;
-      --bbr)         ENABLE_BBR="$2"; shift 2 ;;
+      --accel)       case "${2:-}" in
+                       off|no|none)      ACCEL_PROFILE="off" ;;
+                       standard|on|yes|auto) ACCEL_PROFILE="standard" ;;
+                       aggressive|max)   ACCEL_PROFILE="aggressive" ;;
+                       *) die "--accel 只支持 off | standard | aggressive" ;;
+                     esac; shift 2 ;;
+      --bbr)         # 兼容旧参数：yes/auto → standard，no → off
+                     case "${2:-}" in
+                       no|false|0)   ACCEL_PROFILE="off" ;;
+                       yes|true|1|auto) ACCEL_PROFILE="standard" ;;
+                       off|standard|aggressive) ACCEL_PROFILE="$2" ;;
+                       *) die "--bbr 只支持 auto | yes | no（新参数请用 --accel）" ;;
+                     esac; shift 2 ;;
       --install-method) INSTALL_METHOD="$2"; shift 2 ;;
       --caddy-version)  CADDY_VERSION="$2"; shift 2 ;;
       --fp-tag)         FP_TAG="$2"; shift 2 ;;
       --allow-private)  ALLOW_PRIVATE_NETS="yes"; shift ;;
-      --webroot)        WEBROOT="$2"; shift 2 ;;
+      --webroot)        WEBROOT="$2"; WEBROOT_GIVEN="yes"; shift 2 ;;
       --force|--force-reinstall) FORCE="yes"; shift ;;
       --yes|-y)      ASSUME_YES="yes"; shift ;;
       --non-interactive|-n) INTERACTIVE="no"; shift ;;
@@ -1972,7 +2452,7 @@ main() {
   [[ $# -gt 0 ]] && had_args="yes"
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      install|status|info|start|stop|restart|log|logs|update|renew|uninstall|menu|help|version)
+      install|status|info|start|stop|restart|log|logs|update|renew|uninstall|menu|masq|accel|help|version)
         cmd="$1"; shift ;;
       -h|--help)  usage; exit 0 ;;
       --version)  printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
@@ -1989,6 +2469,7 @@ main() {
     version)   printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
     log|logs)  cmd_log "${1:-120}"; exit 0 ;;
     uninstall) parse_args "$@"; cmd_uninstall; exit 0 ;;
+    accel)     cmd_accel "$@"; exit 0 ;;      # accel 有子命令，不经过通用参数解析
   esac
 
   parse_args "$@"
@@ -2003,6 +2484,8 @@ main() {
     update)    cmd_update ;;
     renew)     cmd_renew ;;
     menu)      cmd_menu ;;
+    masq)      cmd_masq ;;
+    accel)     cmd_accel "${1:-status}" ;;
     "")
       if [[ -f "$STATE_FILE" ]]; then
         if can_prompt; then cmd_menu; else cmd_info; fi

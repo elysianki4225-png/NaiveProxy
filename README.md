@@ -1,7 +1,8 @@
 # NaiveProxy 服务端一键安装脚本
 
 > 在 Debian / Ubuntu 上一键部署 **NaiveProxy 服务端**：`Caddy + forwardproxy-naive`（带 NaiveProxy 填充层的 Caddy），
-> 自动申请 HTTPS 证书、自动生成 systemd 守护进程、自动配置探针伪装（反向代理真实网站），
+> 自动申请 HTTPS 证书、自动生成 systemd 守护进程、自动配置探针伪装（**反代站点由你自己输入**），
+> **默认启用自研加速模块**（纯内核调优 + 连接复用放大，可一键还原），
 > 安装完成后直接输出**可复制粘贴到客户端的节点信息**。
 
 ```
@@ -47,12 +48,13 @@
 | **域名自动生成** | 自动探测公网 IPv4，生成 `<随机8位>.<公网IP>.nip.io`，也支持你自己的域名 |
 | **灵活 ACME CA** | Let's Encrypt / **ZeroSSL（自动获取 EAB 凭据）** / staging / 自定义 ACME 目录，规避 Let's Encrypt 单主域限速 |
 | **HTTP/2 与 HTTP/3** | 默认同时开启 h2(TCP 443) 与 h3(QUIC/UDP 443)，也可只保留其中一种 |
-| **探针伪装** | `probe_resistance` + 反向代理真实网站（默认 bing）或本机静态页面；未鉴权探测看到一个普通网站 |
+| **探针伪装（可自定义反代站点）** | `probe_resistance` + 反向代理**你自己输入的域名/URL**（默认 bing，可随时 `masq` 子命令热切换）或本机静态页面；未鉴权探测看到一个普通网站 |
+| **自研加速模块（默认开启）** | 纯内核参数调优（BBR+fq、收发缓冲、TFO、MTU 探测、队列增大）+ `forward_proxy` 连接复用放大；不下载、不执行任何第三方脚本，三档可切、一键还原，详见 [docs/加速与性能.md](docs/加速与性能.md) |
 | **安全默认值** | 禁止代理访问内网/回环地址、隐藏 `Forwarded`/`Via` 头、`hide_ip`/`hide_via`、以 `caddy` 非 root 用户运行 |
 | **systemd 守护进程** | `Type=notify` + 开机自启 + 自动重启 + `AmbientCapabilities` 绑定 80/443 端口 |
 | **节点信息直出** | 安装后打印：naive `config.json`、命令行、sing-box 出站、`naive+https://` 分享链接、Base64 订阅、可选二维码 |
 | **管理面板** | `bash naiveproxy-install.sh menu` 提供状态、重启、重签证书、更新、卸载等操作 |
-| **可选优化** | BBR 拥塞控制、防火墙（ufw/firewalld）自动放行、日志与自检报告 |
+| **可选优化** | 防火墙（ufw/firewalld）自动放行、日志与自检报告；加速模块默认就已启用，无需干预 |
 
 ---
 
@@ -95,7 +97,7 @@ sudo ./naiveproxy-install.sh install \
   --email you@example.com \
   --ca zerossl \
   --http3 on \
-  --masq reverse --masq-target https://your-blog-or-any-site.com
+  --masq reverse --masq-target your-blog.example.com   # 直接写域名也行，脚本会补 https:// 并检查可达性
 ```
 
 ### 安装后：查看节点信息 / 管理
@@ -127,7 +129,7 @@ sudo bash naiveproxy-install.sh status   # 查看服务与证书状态
 
 ## 4. 安装过程做了什么
 
-脚本按 6 个步骤执行，任何一步失败都会给出明确原因与后续建议：
+脚本按 6 个步骤执行，任何一步失败都会给出明确原因与后续建议（加速模块在步骤 6 内自动完成，无需交互）：
 
 | 步骤 | 动作 | 细节 |
 | --- | --- | --- |
@@ -136,7 +138,8 @@ sudo bash naiveproxy-install.sh status   # 查看服务与证书状态
 | 3 | **端口检查** | 检测 80/443(tcp/udp) 占用；若是已在运行的 Caddy 则复用并在安装后重启 |
 | 4 | **安装 Caddy** | ① 下载 `klzgrad/forwardproxy` 官方预编译包（x86_64，含 QUIC-BBR 补丁）→ ② Caddy 官方在线构建 API → ③ `xcaddy` 源码编译（自动安装符合要求的 Go 工具链） |
 | 5 | **生成配置** | 写入 `/etc/caddy/Caddyfile`（含 forward_proxy、探针伪装、反代/静态页）、生成 systemd 服务并设置开机自启、保存安装信息 |
-| 6 | **启动与验证** | `caddy validate` 校验语法 → 启动服务 → 等待 ACME 证书签发（读取真实证书链验证）→ 探测伪装页面 → **端到端代理自检**（用 curl 直连本机代理访问外网）→ 放行防火墙 → 可选启用 BBR → 生成客户端配置 |
+| 6 | **加速模块（默认开启）** | 按内存自动选择缓冲上限，写入 `/etc/sysctl.d/99-naiveproxy-accel.conf`（BBR+fq、TFO、MTU 探测、队列增大…），立即生效并逐项校验，同时放大 `forward_proxy` 的连接复用参数 |
+| 7 | **启动与验证** | `caddy validate` 校验语法 → 启动服务 → 等待 ACME 证书签发（读取真实证书链验证）→ 探测伪装页面 → **端到端代理自检**（用 curl 直连本机代理访问外网）→ 放行防火墙 → 生成客户端配置（加速模块已在上一步启用） |
 
 安装日志：`/var/log/naiveproxy-install.log`
 
@@ -158,6 +161,10 @@ bash naiveproxy-install.sh [命令] [参数...]
 | `info` | 重新打印节点信息（含客户端配置） |
 | `start` / `stop` / `restart` | 启停服务 |
 | `log [N\|-f]` | 查看日志（默认末尾 120 行，`-f` 实时跟踪） |
+| `masq` | 修改伪装（反向代理目标 / 本机静态页 / 关闭伪装），热重载不中断连接 |
+| `accel [status]` | 查看加速模块状态（档位、拥塞控制、缓冲、连接复用） |
+| `accel apply --profile <档位>` | 切换加速档位（`off` / `standard` / `aggressive`） |
+| `accel off` | 关闭加速模块并恢复原拥塞控制/排队规则 |
 | `update` | 更新 Caddy 二进制（保留配置与证书） |
 | `renew` | 强制重新申请证书（⚠ 会消耗 CA 配额） |
 | `uninstall` | 卸载（可只停服务或彻底清除） |
@@ -180,11 +187,12 @@ bash naiveproxy-install.sh [命令] [参数...]
 | `--http-port <端口>` | 80 | 证书校验与跳转端口 |
 | `--http3 <模式>` | `on` | `on`=h2+h3，`h2only`=仅 h2，`h3only`=关闭 h2（别名 `--h3`） |
 | `--masq <模式>` | `reverse` | `reverse`=反代真实网站，`static`=本机静态页，`none`=404 |
-| `--masq-target <URL>` | `https://www.bing.com` | 反代目标（可填你自己的博客/官网） |
+| `--masq-target <域名/URL>` | `https://www.bing.com` | 反代（伪装）目标：**可直接写域名**（`www.bing.com`）或完整 URL，会做规范化与可达性检查 |
 | `--probe-secret <域名>` | 关闭 | 探针密道域名（需要该域名也解析到本机） |
 | `--run-as <caddy\|root>` | `caddy` | 运行身份（`caddy` 更安全） |
 | `--firewall <auto\|yes\|no>` | `auto` | 是否自动放行 ufw/firewalld 端口 |
-| `--bbr <auto\|yes\|no>` | `auto` | 是否启用 BBR 拥塞控制 |
+| `--accel <档位>` | `standard` | 自研加速模块：`off` / `standard`（默认，安装时自动启用）/ `aggressive`（内存 ≥1.5G 时缓冲翻倍） |
+| `--bbr <auto\|yes\|no>` | `auto` | 兼容旧参数：`auto`/`yes` → `--accel standard`，`no` → `--accel off` |
 | `--install-method <方式>` | `auto` | `auto` \| `prebuilt` \| `source` \| `api` |
 | `--caddy-version <版本>` | `v2.11.7` | 指定 Caddy 版本（源码编译时使用） |
 | `--fp-tag <tag>` | 最新 | 指定预编译包 tag，如 `v2.11.7-naive` |
@@ -219,7 +227,16 @@ sudo ./naiveproxy-install.sh install --https-port 8443 --http-port 8080
 # 6) 刷新/升级已安装的 Caddy
 sudo ./naiveproxy-install.sh update
 
-# 7) 卸载（彻底删除）
+# 7) 换一个反代（伪装）网站：热重载，不中断已有连接
+sudo bash naiveproxy-install.sh masq --masq-target www.cloudflare.com
+sudo bash naiveproxy-install.sh masq --masq static        # 改用本机静态页
+
+# 8) 加速模块：查看 / 切换档位 / 关闭并还原
+sudo bash naiveproxy-install.sh accel
+sudo bash naiveproxy-install.sh accel apply --profile aggressive
+sudo bash naiveproxy-install.sh accel off
+
+# 9) 卸载（彻底删除）
 sudo ./naiveproxy-install.sh uninstall --yes
 ```
 
@@ -239,6 +256,7 @@ sudo ./naiveproxy-install.sh uninstall --yes
   伪装站点       : 反向代理 → https://www.bing.com
   协议支持       : HTTP/2 + HTTP/3
   证书 CA        : zerossl (https://acme.zerossl.com/v2/DV90)
+  加速模块       : standard（拥塞控制=bbr 排队=fq 复用=256/16）
   安装方式       : 预编译二进制 (v2.11.7-naive, naive fork)
 
 【1】官方 naive 客户端 config.json
@@ -399,12 +417,23 @@ caddy version
 caddy list-modules | grep forward_proxy
 caddy build-info | grep -i forwardproxy
 
+# 换伪装（反代）站点：热重载，不断开现有连接
+sudo bash naiveproxy-install.sh masq --masq-target www.cloudflare.com
+sudo bash naiveproxy-install.sh masq --masq static
+
+# 加速模块（默认已开启）
+sudo bash naiveproxy-install.sh accel                              # 查看状态
+sudo bash naiveproxy-install.sh accel apply --profile aggressive   # 切档位
+sudo bash naiveproxy-install.sh accel off                          # 关闭并还原内核参数
+
 # 脚本自带的管理能力
 sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|menu
 ```
 
 更多运维内容（备份迁移、性能调优、排错表、卸载清理）见
 👉 [docs/运维与排错.md](docs/运维与排错.md)
+加速模块的原理、完整参数表与常见问题见
+👉 [docs/加速与性能.md](docs/加速与性能.md)
 
 ---
 
@@ -420,7 +449,8 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 | `/var/lib/caddy/` | Caddy 用户主目录、证书与密钥存储（`.local/share/caddy`） |
 | `/var/www/naiveproxy/` | 静态伪装页面（`--masq static` 时使用） |
 | `/var/log/naiveproxy-install.log` | 安装/管理脚本运行日志 |
-| `/etc/sysctl.d/99-naiveproxy.conf` | BBR 等内核参数（启用 BBR 时生成） |
+| `/etc/sysctl.d/99-naiveproxy-accel.conf` | 自研加速模块的内核参数（默认生成，可读可删；`accel off` 会删除并还原） |
+| `/etc/sysctl.d/99-naiveproxy.conf` | 旧版 BBR 参数文件（仅历史版本会留下，卸载时清理） |
 
 ---
 
@@ -457,13 +487,15 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 			hide_via
 			probe_resistance
 			dial_timeout 30
-			max_idle_conns 128
-			max_idle_conns_per_host 8
+			# 连接复用：随加速档位 standard=256/16、aggressive=512/32、off=128/8
+			max_idle_conns 256
+			max_idle_conns_per_host 16
 			acl {
 				deny 10.0.0.0/8 127.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ::1/128 fe80::/10
 				allow all
 			}
 		}
+		# 伪装内容：这里就是安装时你自己输入的域名/URL（默认 bing）
 		reverse_proxy https://www.bing.com {
 			header_up Host {upstream_hostport}
 		}
@@ -478,8 +510,24 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 | `probe_resistance`（不带参数） | 无凭据 / 凭据错误的探测请求会**原样传给后面的伪装内容**，看起来就是一台普通网站 |
 | `acl` 显式列出内网 deny | 上游默认值即如此，显式写出避免误开放内网跳板 |
 | HTTP/3 默认开启 | Caddy ≥ 2.6 默认监听 QUIC/UDP；脚本仅在需要时用 `servers :443 { protocols h1 h2 }` 关掉 |
+| `max_idle_conns` 随档位变化 | 客户端到伪装网站的连接越多，越接近「正常网站」的流量特征；同时减少反复建连。可用 `accel` 子命令随时调整 |
+| 反代目标由你输入并做可达性检查 | 目标站点在本机访问不通时，探测者会看到 502，比普通网站更可疑；脚本会提前提示 |
 
-### 11.3 systemd 服务
+### 11.3 加速模块（默认启用）
+
+安装第 6 步会自动调用 `accel_apply`，做两件事：
+
+1. **内核侧**（`/etc/sysctl.d/99-naiveproxy-accel.conf`）：`bbr` + `fq`、按内存自适应的收发缓冲上限
+   （8/16/32/64 MB）、`tcp_fastopen=3`、`tcp_notsent_lowat`、`tcp_slow_start_after_idle=0`、
+   `tcp_mtu_probing=1`、keepalive 收紧、`somaxconn`/`syn_backlog`/`netdev_max_backlog` 增大、
+   `udp_*_min` 抬高（HTTP/3 受益）；写完立即 `sysctl -p` 并**逐项读回校验**。
+2. **应用侧**（Caddyfile）：`forward_proxy` 的 `max_idle_conns` / `max_idle_conns_per_host` 随档位放大。
+
+档位 `off` 时不改任何内核参数；`accel off` 会删除参数文件并把拥塞控制/排队规则恢复成安装前的值。
+完整参数表、内存策略、与第三方「一键加速脚本」/TCP Brutal 的区别见
+👉 [docs/加速与性能.md](docs/加速与性能.md)
+
+### 11.4 systemd 服务
 
 `Type=notify`、`User=caddy`、`AmbientCapabilities=CAP_NET_BIND_SERVICE`（非 root 绑定 80/443）、
 `LimitNOFILE=1048576`、`Restart=on-failure`、`ProtectSystem=full`，`XDG_DATA_HOME` 固定到 `/var/lib/caddy`，
@@ -503,6 +551,11 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 | 管理命令 | 打桩环境下逐条执行 `status` / `info` / `menu` / `restart` / `log` / `uninstall --yes`，并检查卸载后无残留文件 | ✅ |
 | `curl \| bash` 场景 | 交互输入改为优先读写 `/dev/tty`（管道喂入 stdin 时也能正常交互），并在无可用终端时自动退化为非交互 | ✅ |
 | 状态文件与只读变量冲突 | 实测发现 `site.env` 里的 `SCRIPT_VERSION` 与脚本只读变量同名会导致 `status`/`menu` 报错，已改名并让读取状态文件容错 | ✅ 已修正 |
+| **加速模块单元测试** | 42 项断言：反代目标规范化（14 例：纯域名/带协议/带端口/带路径/非法输入/空值）、加速计划生成与去重、档位内存自适应（400MB→8MB、800MB→16MB、2GB→32MB、2GB 激进→64MB、1.2GB 激进不翻倍）、B 内核缺 BBR 时的降级、档位校验 | ✅ 42/42 |
+| **加速模块端到端** | 22 项断言：`accel apply standard` 写入参数文件并逐项校验、切换 `aggressive`、`accel off` 恢复原拥塞控制与排队规则、**只读内核（写入失败）时的降级**（不中断、提示未生效项） | ✅ 22/22 |
+| **反代目标（masq）流程** | 非交互与交互两种模式：输入纯域名 → 自动补 `https://`、带路径/查询串自动清理、不可达时提示并确认、非法输入（`ftp://`、非法端口）拒绝且不中断安装、`masq --masq static/none` 切换、Caddyfile 重写 + `caddy validate` + reload + 状态回写 | ✅ |
+| **交互健壮性（EOF）** | 模拟「终端可用但输入流提前结束」（例如 `curl \| bash` 输入耗尽）：修复了 `ask`/`choose` 的**无限重复提示**问题，现在自动退回默认值/非交互模式，`exit=0` 不再死循环 | ✅ 已修正 |
+| 选项变量名冲突 | 修复 `ask input ...` 与 `ask` 内部同名局部变量的冲突（会导致输入内容丢失、反复追问） | ✅ 已修正 |
 
 > 本脚本无法替你在目标机器上申请证书（需要你的真实域名与公网环境），因此**首次安装后请务必确认证书签发成功**：
 > `sudo bash naiveproxy-install.sh status`
@@ -523,9 +576,10 @@ sudo bash naiveproxy-install.sh status|info|restart|log|update|renew|uninstall|m
 **Q3：可以用 IP 直连吗？**
 不行。NaiveProxy 依赖域名 + 有效证书 + SNI，用 IP 会立刻暴露特征。请使用 nip.io 或自有域名。
 
-**Q4：为什么反代 bing 后访问站点是 502？**
-说明服务器无法访问该上游站点（被墙/被风控/需要代理）。换一个服务器能正常访问的站点：
-`--masq-target https://你确定能访问的站点`；或者用 `--masq static` 用本机静态页伪装。
+**Q4：为什么反代站点访问是 502？**
+说明服务器无法访问该上游站点（被墙/被风控/需要代理）。安装时脚本会用 curl 预检并提示；
+换一个服务器能正常访问的站点即可（**安装时直接输入域名**，或事后热切换）：
+`sudo bash naiveproxy-install.sh masq --masq-target 你确定能访问的站点`；也可以 `masq --masq static` 用本机静态页伪装。
 
 **Q5：HTTP/3 有什么用？要开吗？**
 QUIC 在丢包严重的跨境线路上通常更快，且部分网络对 UDP 443 不限速。默认同时开 h2+h3，客户端自己选。
@@ -538,11 +592,24 @@ mihomo（Clash Meta）目前**没有** naive 出站支持；请使用官方 naiv
 脚本占用 80/443。若已被占用会提示并可自动停止占用进程；如果你已有 Nginx/Apache/Caddy，建议改用其它端口或把反代伪装指向本机站点。
 
 **Q8：怎么换伪装站点 / 换域名 / 换端口？**
-重新运行安装并加 `--force`（会备份原 Caddyfile），例如
-`sudo bash naiveproxy-install.sh install --domain new.example.com --masq-target https://example.org --force`。
-⚠ 换域名会重新申请证书（消耗 CA 配额）。
+- 只换伪装（反代）站点：`sudo bash naiveproxy-install.sh masq --masq-target www.example.com`
+  （或 `masq` 进入交互选择；会备份 Caddyfile → 校验 → `caddy reload` 热重载，不断开连接）
+- 换域名 / 端口：重新运行安装并加 `--force`（会备份原 Caddyfile），例如
+  `sudo bash naiveproxy-install.sh install --domain new.example.com --http3 h2only --force`
+  ⚠ 换域名会重新申请证书（消耗 CA 配额）。
 
-更多问答与排错命令见 [docs/运维与排错.md](docs/运维与排错.md)。
+**Q9：加速模块是什么？会不会改坏我的系统？我可以关掉吗？**
+它是本仓库自己实现的一段 shell 逻辑（**不下载、不执行任何第三方脚本**），只写一个
+`/etc/sysctl.d/99-naiveproxy-accel.conf` 并调整 `forward_proxy` 的连接复用参数，**安装时默认启用**。
+所有参数都是「上限/开关」，不会预分配内存，且按内存自动收缩。想关就一句：
+`sudo bash naiveproxy-install.sh accel off`（删除参数文件并恢复原拥塞控制/排队规则）。
+详见 [docs/加速与性能.md](docs/加速与性能.md)。
+
+**Q10：装完显示「N 项内核参数未生效」？**
+常见于受限容器（LXC/OpenVZ/部分面板 KVM）不允许改这些参数；脚本会保留参数文件，系统重启后由
+`systemd-sysctl` 再尝试一次。长期不生效就 `accel off`，或忽略（仅影响吞吐，不影响可用性）。
+
+更多问答与排错命令见 [docs/运维与排错.md](docs/运维与排错.md)，加速相关见 [docs/加速与性能.md](docs/加速与性能.md)。
 
 ---
 
@@ -566,6 +633,8 @@ mihomo（Clash Meta）目前**没有** naive 出站支持；请使用官方 naiv
 | [examples/naive-config.json](examples/naive-config.json) | 官方客户端配置示例 |
 | [examples/sing-box-outbound.json](examples/sing-box-outbound.json) | sing-box 出站示例 |
 | [examples/caddy.service](examples/caddy.service) | systemd 服务单元示例 |
+| [docs/加速与性能.md](docs/加速与性能.md) | 自研加速模块：原理、完整参数表、档位、验证与回滚、FAQ |
+| [examples/accel.conf.example](examples/accel.conf.example) | 加速模块生成的 `/etc/sysctl.d/99-naiveproxy-accel.conf` 示例 |
 
 ### 致谢 / 上游项目
 

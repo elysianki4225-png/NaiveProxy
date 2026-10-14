@@ -1,0 +1,62 @@
+# ------------------------------------------------------------------------------
+# 示例文件：由 naiveproxy-install.sh 生成（域名/账号/密码为占位值，请勿直接使用）
+# 实际安装时脚本会按你的输入生成 /etc/caddy/Caddyfile，无需手工编辑本文件。
+# 各部分含义见 README.md「配置文件说明」与 docs/ 目录。
+# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# NaiveProxy 服务端配置（Caddy + forwardproxy-naive）
+# 由 naiveproxy-install.sh v1.0.0 自动生成，生成时间: 2026-10-14 11:46:07
+# 项目文档: https://github.com/elysianki4225-png/NaiveProxy
+# ⚠ 本文件包含代理账号密码，请勿公开分享（root:caddy 0640）
+# ==============================================================================
+
+{
+	# forward_proxy 默认顺序在 file_server 之后；提前便于静态文件/反代兜底
+	order forward_proxy before file_server
+
+	# ACME 账户邮箱（证书到期通知）
+	email you@example.com
+
+	# 证书颁发机构（切换 ACME CA 可规避 LE 的单主域 50 张/周 频率限制）
+	acme_ca https://acme.zerossl.com/v2/DV90
+	# ZeroSSL 要求的 External Account Binding (EAB) 凭据
+	acme_eab {
+		key_id EAB_KEY_ID_FROM_ZEROSSL
+		mac_key EAB_HMAC_KEY_FROM_ZEROSSL
+	}
+
+	http_port 80
+	https_port 443
+}
+
+# 提示: 地址列表中的 ":443" 必须写在最前面，
+# 否则 forward_proxy 无法处理任意目标的代理请求（上游 Caddyfile 要求）
+:443, proxy.example.com {
+	encode zstd gzip
+
+	# ---- 代理处理：先尝试 forward_proxy，未通过鉴权则自动落到下面的伪装内容 ----
+	route {
+		forward_proxy {
+			basic_auth your-username your-strong-password
+			hide_ip
+			hide_via
+			# 未鉴权的探测请求会被当作普通网站访客处理（探针伪装）
+			probe_resistance
+			dial_timeout 30
+			max_idle_conns 128
+			max_idle_conns_per_host 8
+			# 禁止代理访问本机/内网地址（默认安全策略，防止被用作内网跳板）
+			acl {
+				deny 10.0.0.0/8 127.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ::1/128 fe80::/10
+				allow all
+			}
+		}
+
+		# ---- 伪装内容 1/2：反向代理到一个真实网站 ----
+		reverse_proxy https://www.bing.com {
+			# 使用上游主机名作为 Host，避免上游站点因 Host 不匹配而拒绝
+			header_up Host {upstream_hostport}
+		}
+	}
+}

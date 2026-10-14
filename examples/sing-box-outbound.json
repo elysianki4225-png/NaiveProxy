@@ -1,0 +1,13 @@
+{
+  "type": "naive",
+  "tag": "naive-out",
+  "server": "proxy.example.com",
+  "server_port": 443,
+  "username": "your-username",
+  "password": "your-strong-password",
+  "quic": false,
+  "tls": {
+    "enabled": true,
+    "server_name": "proxy.example.com"
+  }
+}
